@@ -1,85 +1,120 @@
 # Pekora — Implementation Plan
 
-> **Project name:** Pekora  
-> **Scope:** Personal, local-first PPT generator web app.  
-> **Status:** Build plan with representative starter code. Snippets establish interfaces and patterns; they are not a complete production application.
+> **Product:** Personal, local-first AI presentation generator.  
+> **Canonical state:** Pekora slide JSON.  
+> **Canva role:** Optional final handoff for further visual editing; Canva changes do not sync back into Pekora.  
+> **Code status:** Representative implementation code and contracts—not a finished application.
 
 ---
 
-## 1. Product contract
+## 1. Product definition
 
-Pekora accepts a topic, pasted text, URLs, PDFs, and images; creates a presentation using fixed layouts; permits small corrections; and exports PPTX, PDF, and PNG slides. It optionally generates a presentation script.
+Pekora turns a topic, pasted text, URL, PDF, or images into a presentation. It offers quick and guided creation, fixed layouts and themes, limited corrections, image approval before use, speaker scripts, and exports to PPTX, PDF, and PNG.
 
-Non-negotiable rules:
+The app supports multiple cloud-model providers and a local Ollama option when Ollama is already running. It never auto-installs models and it does not generate images.
 
-1. Slide JSON is the source of truth; never edit a generated PPTX as application state.
-2. Models provide validated content, not slide geometry or templates.
-3. Internet images are searched only when requested and are included only after explicit approval.
-4. Ollama is optional and shown only when a local service and installed model are detected.
-5. A non-AI fallback creates a plain deck from source headings/paragraphs.
+### Core rules
 
----
-
-## 2. Proposed stack
-
-| Layer | Technology | Why |
-| --- | --- | --- |
-| API | Python 3.11+, FastAPI, Pydantic v2 | Strong schemas and async APIs |
-| UI | React, TypeScript, Vite, PWA | Fast local UI and later mobile-friendly installation |
-| Storage | SQLite + SQLAlchemy/Alembic | Appropriate for one local user |
-| PPTX | python-pptx | Deterministic PowerPoint creation |
-| PDF/PNG | LibreOffice headless + PyMuPDF | One PPTX-based export path |
-| Ingest | PyMuPDF, Tesseract, trafilatura, Pillow | PDF, OCR, URL, and image processing |
-| AI | Gemini, Groq, OpenRouter, one direct paid provider, Ollama | Task-based routing and fallback |
-| Jobs | SQLite job records + in-process worker initially | Observable local jobs without premature infrastructure |
-
-Use Docker Compose only after the local developer path works; it is a packaging option, not a prerequisite for the first vertical slice.
+1. **Deck JSON is the source of truth.** UI changes modify validated JSON; PPTX/PDF/PNG are rebuilt artifacts.
+2. **AI writes content, not layouts.** Models select only from Pekora-owned layout IDs and schema fields.
+3. **Images require approval.** Search results are never included until the user explicitly approves them.
+4. **Canva is a one-way handoff.** Pekora exports/imports a finished PPTX to Canva, then opens Canva for human editing. Canva changes are a separate Canva version.
+5. **Offline failure is graceful.** Without network or Ollama, Pekora can still create a basic deck from headings and paragraphs.
 
 ---
 
-## 3. Repository shape
+## 2. Architecture
+
+```text
+React PWA
+  ├─ input / brief / theme settings
+  ├─ outline and image approval gallery
+  ├─ small corrective editor
+  ├─ export controls
+  └─ Canva Connect + Open in Canva
+              │
+              ▼
+FastAPI
+  ├─ ingest: text, PDF, OCR, URL
+  ├─ AI router: cloud providers + OpenRouter + optional Ollama
+  ├─ schema validation and fallback policy
+  ├─ fixed-layout PPTX builder
+  ├─ LibreOffice PDF + PyMuPDF PNG renderer
+  ├─ approved-image service
+  ├─ speaker-script service
+  └─ Canva OAuth + import handoff service
+              │
+       ┌──────┼────────┬──────────────┐
+       ▼      ▼        ▼              ▼
+    Models  Ollama   Image sources   Canva REST APIs
+                                      ├─ OAuth PKCE
+                                      ├─ PPTX design import
+                                      └─ optional design generation (preview)
+```
+
+### Canva integration boundary
+
+**Recommended v1:** build in Pekora, export the completed PPTX, import it into the user’s Canva account, and show the resulting Canva edit link. Canva’s import API supports PPTX and returns asynchronous job results containing temporary edit/view URLs. [Canva Design Import](https://www.canva.dev/docs/apps/rest-apis/reference/design-imports/create-design-import-job/)
+
+**Not v1:** bidirectional synchronization. Canva can be used to continue editing a presentation, but Pekora must warn that post-handoff Canva edits will not update Pekora’s deck JSON.
+
+**Experimental later:** Canva design generation. Canva can generate a presentation from a brief and slide outline, but this API is preview-only, consumes the user’s Canva AI credits, and should never replace Pekora’s deterministic deck engine. [Canva Design Generation](https://www.canva.dev/docs/apps/rest-apis/reference/generations/create-design-generation-job/)
+
+---
+
+## 3. Project structure
 
 ```text
 pekora/
 ├── apps/
 │   ├── api/
-│   │   ├── app/
-│   │   │   ├── main.py
-│   │   │   ├── core/          # settings, errors, security
-│   │   │   ├── contracts/     # Pydantic schemas
-│   │   │   ├── api/           # FastAPI routers
-│   │   │   ├── services/      # orchestration and use cases
-│   │   │   ├── ai/            # provider adapters and router
-│   │   │   ├── builder/       # layouts and PPTX build
-│   │   │   ├── ingest/        # PDF, URL, OCR
-│   │   │   ├── images/        # assets, searches, approval
-│   │   │   ├── export/        # LibreOffice/PDF/PNG
-│   │   │   └── db/            # persistence
-│   │   └── tests/
+│   │   └── app/
+│   │       ├── api/             # FastAPI routes
+│   │       ├── contracts/       # Pydantic DTOs / JSON schemas
+│   │       ├── core/            # config, errors, security
+│   │       ├── db/              # SQLite models and migrations
+│   │       ├── ingest/          # PDF, URL, OCR, source chunks
+│   │       ├── ai/              # provider adapters, router, validator
+│   │       ├── images/          # upload, search, approval, attribution
+│   │       ├── builder/         # fixed layouts and python-pptx output
+│   │       ├── export/          # PDF, PNG and ZIP creation
+│   │       ├── scripts/         # speaker script generation
+│   │       └── canva/           # OAuth, token store, import/generation client
 │   └── web/
-│       └── src/features/      # create, images, editor, export
-├── packages/contracts/        # optional generated TS types/JSON schemas
+│       └── src/features/        # create, editor, images, export, canva
 ├── assets/fonts/
-├── data/                      # ignored: db, uploads, cache, exports
+├── data/                        # ignored: SQLite, assets, cache, exports
 ├── docker-compose.yml
 └── .env.example
 ```
 
 ---
 
-## 4. Phase 0 — Establish the contracts before integrations
+## 4. Data contracts and database records
 
-Create the shared objects first. Every provider, editor action, export, and test consumes these structures.
+### Essential records
 
-### 4.1 Pydantic slide contract
+| Record | Purpose |
+| --- | --- |
+| `projects` | Brief, mode, grounding setting, selected theme, current status |
+| `sources` | Normalized text chunks and provenance (file/page/URL/chunk) |
+| `outlines` | Revisioned outline used before image search/deck generation |
+| `decks` | Current validated deck JSON and revision number |
+| `assets` | Uploaded/approved images, licensing, attribution, local cache path |
+| `jobs` | Ingest, generation, render, script, Canva-import status/progress |
+| `provider_usage` | Model/provider usage, categorized errors, circuit-breaker state |
+| `canva_connections` | Encrypted Canva refresh token, granted scopes, connection status |
+| `canva_handoffs` | Deck revision, export artifact hash, Canva import job/design ID, edit-link expiry |
+
+Never store a Canva access token in the browser or in unencrypted SQLite fields.
+
+### Slide schema
 
 ```python
 # apps/api/app/contracts/deck.py
 from enum import Enum
-from typing import Literal
 from uuid import UUID, uuid4
-from pydantic import BaseModel, Field, HttpUrl, model_validator
-
+from pydantic import BaseModel, Field, model_validator
 
 class LayoutId(str, Enum):
     TITLE = "title"
@@ -89,129 +124,102 @@ class LayoutId(str, Enum):
     QUOTE = "quote"
     CLOSING = "closing"
 
-
-class SourceRef(BaseModel):
-    source_id: UUID
-    locator: str | None = None  # e.g. PDF page, URL fragment, chunk id
-
-
 class AssetRef(BaseModel):
     asset_id: UUID
-    role: Literal["primary_image", "supporting_image"]
-
-
-class TextBlock(BaseModel):
-    kind: Literal["bullets", "paragraph", "quote", "caption"]
-    text: str | None = None
-    bullets: list[str] = Field(default_factory=list, max_length=6)
-
+    role: str = "primary_image"
 
 class Slide(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     order: int = Field(ge=0)
     layout_id: LayoutId
     title: str = Field(min_length=1, max_length=120)
-    blocks: list[TextBlock] = Field(default_factory=list, max_length=3)
+    bullets: list[str] = Field(default_factory=list, max_length=6)
     assets: list[AssetRef] = Field(default_factory=list, max_length=3)
     speaker_notes: str = ""
-    source_refs: list[SourceRef] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
     verification_flags: list[str] = Field(default_factory=list)
-    alt_text: str | None = None
 
     @model_validator(mode="after")
-    def layout_rules(self) -> "Slide":
+    def check_layout_assets(self):
         if self.layout_id == LayoutId.IMAGE_TEXT and not self.assets:
-            raise ValueError("image_text slides require an approved image asset")
-        if self.layout_id != LayoutId.IMAGE_TEXT and len(self.assets) > 0:
-            raise ValueError("this initial layout catalog does not accept images here")
+            raise ValueError("image_text requires an approved image asset")
+        if self.layout_id != LayoutId.IMAGE_TEXT and self.assets:
+            raise ValueError("this layout does not accept image assets")
         return self
-
 
 class Deck(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     project_id: UUID
-    theme_id: UUID
+    revision: int = Field(ge=1)
     slides: list[Slide] = Field(min_length=1, max_length=50)
-
-    @model_validator(mode="after")
-    def slide_order_is_contiguous(self) -> "Deck":
-        if [s.order for s in self.slides] != list(range(len(self.slides))):
-            raise ValueError("slides must be ordered contiguously from zero")
-        return self
 ```
 
-Keep layout-specific text budgets in a separate catalog rather than scattering limits in prompt code:
-
-```python
-# apps/api/app/builder/layouts.py
-from dataclasses import dataclass
-from app.contracts.deck import LayoutId
-
-@dataclass(frozen=True)
-class LayoutSpec:
-    max_title_chars: int
-    max_bullets: int
-    max_bullet_chars: int
-    accepts_images: bool
-
-LAYOUTS: dict[LayoutId, LayoutSpec] = {
-    LayoutId.TITLE: LayoutSpec(70, 0, 0, False),
-    LayoutId.BULLETS: LayoutSpec(100, 5, 110, False),
-    LayoutId.TWO_COLUMN: LayoutSpec(90, 6, 75, False),
-    LayoutId.IMAGE_TEXT: LayoutSpec(90, 4, 90, True),
-    LayoutId.QUOTE: LayoutSpec(80, 0, 0, False),
-    LayoutId.CLOSING: LayoutSpec(90, 4, 90, False),
-}
-```
-
-**Done when:** invalid layout/asset combinations and overflow-risk payloads cannot enter the builder.
+The builder validates per-layout title/bullet limits separately from the model schema. That makes it possible to refine layout budgets without changing every API contract.
 
 ---
 
-## 5. Phase 1 — Build the deterministic deck engine
+## 5. Main generation pipeline
 
-Implement a hand-authored deck fixture → PPTX → PDF → PNG route before adding AI.
+```text
+Input
+  → ingest + provenance
+  → project brief
+  → validated outline
+  → optional image search + explicit approval
+  → validated slide JSON
+  → limited corrections
+  → PPTX build
+  → PDF render
+  → PNG ZIP
+  → optional Canva import handoff
+```
 
-### 5.1 Builder boundary
+### Input rules
+
+- A user-uploaded image must be classified as **slide image**, **source to read**, or **theme reference**.
+- URL fetches reject local/private/reserved IP destinations, including redirects.
+- PDF/OCR/URL content is wrapped as untrusted source data; it is never treated as model instructions.
+- Grounded mode uses only input sources. Creative mode can add material but marks unsourced factual claims for review.
+
+### Image approval gate
+
+Pekora uses clear-license sources first (for example Unsplash, Pexels, Pixabay, Wikimedia Commons, Openverse, and eligible public collections). It displays candidate source/license data and thumbnails. The user must approve, reject, replace, or skip each candidate before deck generation. Any open-web source is disabled by default and labelled as license-unknown when enabled.
+
+---
+
+## 6. Deterministic PPTX, PDF, and PNG generation
 
 ```python
 # apps/api/app/builder/service.py
 from pathlib import Path
 from pptx import Presentation
 from app.contracts.deck import Deck
-from app.builder.layouts import LAYOUTS
-
 
 class DeckBuilder:
-    def build(self, deck: Deck, output_path: Path) -> Path:
-        presentation = Presentation()
-        presentation.slide_width = 13_333_333   # 16:9 EMU
-        presentation.slide_height = 7_500_000
+    def build(self, deck: Deck, output: Path) -> Path:
+        ppt = Presentation()
+        ppt.slide_width = 13_333_333  # 16:9, in EMU
+        ppt.slide_height = 7_500_000
 
         for slide in deck.slides:
-            self._validate_budget(slide)
-            self._add_slide(presentation, slide, deck.theme_id)
+            self.validate_layout_budget(slide)
+            self.add_fixed_layout(ppt, slide)
 
-        presentation.save(output_path)
-        return output_path
+        ppt.save(output)
+        return output
 
-    def _validate_budget(self, slide) -> None:
-        spec = LAYOUTS[slide.layout_id]
-        if len(slide.title) > spec.max_title_chars:
-            raise ValueError(f"Slide {slide.id}: title exceeds layout budget")
-        for block in slide.blocks:
-            if len(block.bullets) > spec.max_bullets:
-                raise ValueError(f"Slide {slide.id}: too many bullets")
-            if any(len(item) > spec.max_bullet_chars for item in block.bullets):
-                raise ValueError(f"Slide {slide.id}: bullet exceeds layout budget")
+    def validate_layout_budget(self, slide) -> None:
+        if len(slide.title) > 100:
+            raise ValueError(f"Slide {slide.order + 1}: title is too long")
+        if len(slide.bullets) > 5:
+            raise ValueError(f"Slide {slide.order + 1}: too many bullets")
+        if any(len(item) > 110 for item in slide.bullets):
+            raise ValueError(f"Slide {slide.order + 1}: bullet is too long")
 
-    def _add_slide(self, presentation: Presentation, slide, theme_id) -> None:
-        # Dispatch only to owned, tested layout functions.
-        # Never render arbitrary coordinates returned by an AI model.
+    def add_fixed_layout(self, ppt: Presentation, slide) -> None:
+        # Dispatch by owned LayoutId. Never use AI-generated coordinates.
         raise NotImplementedError
 ```
-
-### 5.2 Export pipeline
 
 ```python
 # apps/api/app/export/render.py
@@ -219,121 +227,31 @@ import subprocess
 from pathlib import Path
 import fitz  # PyMuPDF
 
-
-def render_pptx(pptx_path: Path, work_dir: Path, png_dpi: int = 150) -> tuple[Path, list[Path]]:
+def render_to_pdf_and_png(pptx: Path, work_dir: Path, dpi: int = 150):
     subprocess.run(
-        ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(work_dir), str(pptx_path)],
-        check=True,
-        timeout=90,
-        cwd=work_dir,
+        ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(work_dir), str(pptx)],
+        cwd=work_dir, check=True, timeout=90,
     )
-    pdf_path = work_dir / f"{pptx_path.stem}.pdf"
-    if not pdf_path.exists():
-        raise RuntimeError("LibreOffice did not produce PDF output")
-
-    document = fitz.open(pdf_path)
-    pngs: list[Path] = []
-    zoom = png_dpi / 72
-    for index, page in enumerate(document):
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        target = work_dir / f"slide-{index + 1:02d}.png"
-        pixmap.save(target)
-        pngs.append(target)
-    return pdf_path, pngs
+    pdf = work_dir / f"{pptx.stem}.pdf"
+    document = fitz.open(pdf)
+    images = []
+    for i, page in enumerate(document):
+        target = work_dir / f"slide-{i + 1:02d}.png"
+        page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False).save(target)
+        images.append(target)
+    return pdf, images
 ```
 
-Run LibreOffice inside a job-specific temporary directory. Add process limits and cleanup policy before exposing the endpoint beyond local use.
-
-**Done when:** a six-slide fixture produces a PPTX, six-page PDF, and ZIP containing six PNGs.
+Run LibreOffice only in a job-specific temporary directory. A release test gallery must render every layout, theme, font, and maximum-content fixture.
 
 ---
 
-## 6. Phase 2 — API and project/job persistence
+## 7. Multi-model routing and local mode
 
-Use explicit job records even if the first worker is in-process. That makes progress, retries, and future queue migration possible.
-
-### 6.1 API shape
-
-| Endpoint | Function |
-| --- | --- |
-| `POST /projects` | Create draft project/brief |
-| `POST /projects/{id}/ingest` | Add text, file, or URL sources |
-| `POST /projects/{id}/outline` | Queue outline generation |
-| `POST /projects/{id}/images/search` | Search images for an outline revision |
-| `POST /projects/{id}/images/approve` | Approve/reject a candidate asset |
-| `POST /projects/{id}/generate` | Generate validated deck JSON |
-| `PATCH /decks/{id}/slides/{slide_id}` | Perform a corrective edit |
-| `POST /decks/{id}/exports` | Queue PPTX/PDF/PNG export |
-| `POST /decks/{id}/script` | Generate speaker script |
-| `GET /jobs/{id}` | Read state/progress/result |
-| `GET /providers/status` | Read configured/detected capabilities only |
-
-### 6.2 Example route and use case
+### Provider contract
 
 ```python
-# apps/api/app/api/routes/projects.py
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
-from app.services.projects import ProjectService
-
-router = APIRouter(prefix="/projects", tags=["projects"])
-
-class CreateProjectRequest(BaseModel):
-    title: str = Field(min_length=1, max_length=160)
-    topic: str | None = Field(default=None, max_length=8_000)
-    slide_count: int = Field(default=8, ge=1, le=50)
-    mode: str = Field(default="quick", pattern="^(quick|guided)$")
-
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_project(payload: CreateProjectRequest, service: ProjectService) -> dict:
-    project = await service.create(payload)
-    return {"id": str(project.id), "status": project.status}
-```
-
-The actual dependency provider for `ProjectService`, database sessions, authentication (if later needed), and exception mapping belongs in `main.py`/dependency modules—not inside routes.
-
-**Done when:** a browser can create a project, observe a job, and retrieve the current deck JSON.
-
----
-
-## 7. Phase 3 — Ingestion and safety boundary
-
-Input sources are data, never instructions. Preserve provenance so grounded decks and scripts can point back to pages/chunks.
-
-```python
-# apps/api/app/ingest/url_guard.py
-import ipaddress
-import socket
-from urllib.parse import urlparse
-
-BLOCKED_HOSTS = {"localhost", "localhost.localdomain"}
-
-def assert_public_http_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("Only absolute HTTP(S) URLs are accepted")
-    if parsed.hostname.lower() in BLOCKED_HOSTS:
-        raise ValueError("Local URLs are not allowed")
-
-    addresses = socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM)
-    for _, _, _, _, address in addresses:
-        ip = ipaddress.ip_address(address[0])
-        if not ip.is_global:
-            raise ValueError("Non-public network addresses are not allowed")
-```
-
-Re-run this check for each redirect target, impose small response-size/time limits, and verify file signatures after download. Do not rely only on this sample code for production SSRF controls; resolver rebinding and proxy/network policy need integration tests.
-
-**Done when:** PDF pages, URL text, and OCR output become normalized chunks with source IDs; local/private URLs and oversize/spoofed files are rejected safely.
-
----
-
-## 8. Phase 4 — Provider abstraction and safe fallback
-
-Models return contracts, never arbitrary markdown that the builder tries to interpret.
-
-```python
-# apps/api/app/ai/providers/base.py
+# apps/api/app/ai/base.py
 from typing import Protocol
 from app.contracts.deck import Deck
 
@@ -344,181 +262,271 @@ class GenerationError(Exception):
 
 class DeckProvider(Protocol):
     name: str
-
-    async def generate_deck(self, request: "DeckGenerationRequest") -> Deck:
-        ...
-
-    async def generate_script(self, request: "ScriptRequest") -> "SpeakerScript":
-        ...
+    async def generate_deck(self, request) -> Deck: ...
+    async def generate_script(self, request): ...
 ```
 
-```python
-# apps/api/app/ai/router.py
-class ProviderRouter:
-    def __init__(self, providers: list[DeckProvider], circuit_breaker, usage_store):
-        self.providers = providers
-        self.circuit_breaker = circuit_breaker
-        self.usage_store = usage_store
+### Router policy
 
-    async def generate_deck(self, request):
-        failures = []
-        for provider in self.providers:
-            if self.circuit_breaker.is_open(provider.name):
-                continue
-            try:
-                result = await provider.generate_deck(request)
-                self.usage_store.record_success(provider.name)
-                return result
-            except GenerationError as exc:
-                self.usage_store.record_failure(provider.name, exc.kind)
-                self.circuit_breaker.record_failure(provider.name, exc.kind)
-                failures.append({"provider": provider.name, "kind": exc.kind})
-        raise RuntimeError({"message": "No configured model could generate a deck", "failures": failures})
-```
+- Outline/slide JSON: reliable structured-output cloud model → alternate provider → OpenRouter model → detected Ollama → non-AI deck when appropriate.
+- Speaker script: stronger writing provider → alternate provider → Ollama with quality warning.
+- Use bounded JSON repair, max attempts, categorized errors, and circuit breakers.
+- Display the actual model/provider used on the result.
 
-Use distinct sequences per task. Outline and schema work prioritize structured-output reliability; speaker scripts prioritize writing quality. Include Ollama only in the sequence when its health endpoint confirms a selected installed model.
+### Ollama rule
 
-**Done when:** mocked 429, timeout, and malformed JSON responses select the next eligible provider, stop within the retry budget, and expose a useful final failure.
+Pekora calls a configurable local endpoint (normally `http://127.0.0.1:11434`) to list installed models. Local mode is unavailable if that check fails; Pekora must not download models. Manual RAM/VRAM/unified-memory settings are recommendations, not claimed hardware detection.
 
 ---
 
-## 9. Phase 5 — Image search and explicit approval
+## 8. Canva implementation plan
 
-Search happens after outline generation and before deck generation. The deck generator receives only approved `asset_id` references.
+### 8.1 Canva scope and user experience
+
+Add Canva only after Pekora’s native PPTX/PDF/PNG route works.
+
+1. User clicks **Connect Canva**.
+2. Pekora opens the Canva OAuth consent page.
+3. Canva redirects back to Pekora; Pekora securely stores the token connection.
+4. User finishes/corrects a Pekora deck and selects **Open in Canva**.
+5. Pekora builds the current PPTX revision and starts a Canva import job.
+6. Pekora polls the job, stores the Canva design metadata, then presents **Continue editing in Canva**.
+7. The UI states: “Changes made in Canva stay in Canva and do not update this Pekora deck.”
+
+Canva REST APIs use OAuth 2.0 Authorization Code with PKCE; token exchange must occur server-side. [Canva OAuth documentation](https://www.canva.dev/docs/apps/rest-apis/authentication/)
+
+### 8.2 Minimum OAuth scopes
+
+| Feature | Scope |
+| --- | --- |
+| Import Pekora PPTX into Canva | `design:content:write` |
+| Read/refresh design metadata and links | `design:meta:read` |
+| Future asset upload | `asset:write` (and `asset:read` if reading assets) |
+| Experimental Canva design generation | `design:content:write`, plus Canva’s user `design_generation` capability |
+
+Request only features actually enabled. Canva scopes are explicit; a write scope does not imply its matching read scope. [Canva scope reference](https://www.canva.dev/docs/apps/rest-apis/scopes/)
+
+### 8.3 OAuth route and PKCE state
 
 ```python
-# apps/api/app/images/service.py
-from uuid import UUID
+# apps/api/app/canva/oauth.py
+import base64
+import hashlib
+import secrets
+from urllib.parse import urlencode
 
-class ImageService:
-    async def approve(self, project_id: UUID, candidate_id: UUID) -> UUID:
-        candidate = await self.repository.get_candidate(project_id, candidate_id)
-        if candidate is None:
-            raise ValueError("Unknown image candidate")
-        local_asset = await self.downloader.fetch_and_normalize(candidate.url)
-        return await self.repository.create_asset(
-            project_id=project_id,
-            path=local_asset.path,
-            sha256=local_asset.sha256,
-            source_url=candidate.url,
-            license_name=candidate.license_name,
-            attribution=candidate.attribution,
-            approved=True,
-        )
+CANVA_AUTHORIZE_URL = "https://www.canva.com/api/oauth/authorize"
+
+def begin_authorization(client_id: str, redirect_uri: str) -> tuple[str, dict]:
+    verifier = secrets.token_urlsafe(72)[:128]
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(32)
+    params = {
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "scope": "design:content:write design:meta:read",
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    # Persist state + verifier server-side with a short expiration before redirecting.
+    return f"{CANVA_AUTHORIZE_URL}?{urlencode(params)}", {"state": state, "verifier": verifier}
 ```
 
-Required implementation details:
+```python
+# apps/api/app/api/routes/canva.py
+from fastapi import APIRouter, HTTPException
 
-- Search clear-license adapters in parallel; make open-web search an off-by-default capability.
-- Normalize license/source/author/width/height metadata before ranking.
-- Apply perceptual deduplication, resolution/aspect filtering, and source-level timeouts.
-- Show source and license badges in the UI, with approve/reject/search again/upload/skip controls.
-- Revalidate direct image URLs using the same URL guard; strip EXIF, validate MIME/signature, resize, convert to PNG/JPEG, and cache locally.
+router = APIRouter(prefix="/integrations/canva", tags=["canva"])
 
-**Done when:** an image cannot be attached to a slide unless an approved asset record exists.
+@router.get("/callback")
+async def canva_callback(code: str, state: str):
+    pending = await oauth_state_store.consume(state)
+    if pending is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired Canva authorization state")
+    # Exchange `code` server-side using pending.verifier and the client secret.
+    # Encrypt refresh/access credentials before persistence.
+    await canva_service.complete_authorization(code, pending.verifier)
+    return {"connected": True}
+```
 
----
+Never expose `client_secret`, authorization-code exchange, `code_verifier`, refresh token, or Canva access token to React.
 
-## 10. Phase 6 — React flow and corrective editor
+### 8.4 Import the current Pekora PPTX
 
-Keep client state small. The server is authoritative for persisted deck/job state.
+Canva imports external files through `POST /rest/v1/imports` using the raw file bytes, `application/octet-stream`, and an `Import-Metadata` header. Its import result is asynchronous. [Canva import endpoint](https://www.canva.dev/docs/apps/rest-apis/reference/design-imports/create-design-import-job/)
+
+```python
+# apps/api/app/canva/client.py
+import base64
+import json
+from pathlib import Path
+import httpx
+
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+class CanvaClient:
+    def __init__(self, access_token: str):
+        self.headers = {"Authorization": f"Bearer {access_token}"}
+
+    async def import_pptx(self, pptx_path: Path, title: str) -> str:
+        metadata = {
+            "title_base64": base64.b64encode(title[:50].encode("utf-8")).decode(),
+            "mime_type": PPTX_MIME,
+        }
+        headers = {
+            **self.headers,
+            "Content-Type": "application/octet-stream",
+            "Import-Metadata": json.dumps(metadata),
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://api.canva.com/rest/v1/imports",
+                headers=headers,
+                content=pptx_path.read_bytes(),
+            )
+            response.raise_for_status()
+        return response.json()["job"]["id"]
+
+    async def get_import_job(self, job_id: str) -> dict:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                f"https://api.canva.com/rest/v1/imports/{job_id}",
+                headers=self.headers,
+            )
+            response.raise_for_status()
+        return response.json()["job"]
+```
+
+Production refinement: stream the file instead of `read_bytes()` for larger exports, refresh an expired access token before calls, apply a bounded polling/backoff policy, and map Canva errors (`invalid_file`, throttling, duplicate import) to user-friendly messages.
+
+### 8.5 Pekora handoff route
+
+```python
+# apps/api/app/api/routes/canva_handoff.py
+@router.post("/decks/{deck_id}/canva-handoff", status_code=202)
+async def create_canva_handoff(deck_id: str):
+    connection = await canva_connections.require_active()
+    deck = await deck_repository.get_current(deck_id)
+    pptx = await export_service.build_current_pptx(deck)
+    job_id = await CanvaClient(await connection.access_token()).import_pptx(pptx, deck.title)
+    job = await jobs.create(kind="canva_import", external_id=job_id, deck_id=deck.id)
+    return {"job_id": str(job.id), "status": "queued"}
+```
+
+When the import job succeeds, record Canva’s design ID and its `edit_url`. Canva documents these returned URLs as temporary (currently 30 days), so Pekora must refresh design information rather than treating an old saved link as permanent. [Canva import-job response](https://www.canva.dev/docs/apps/rest-apis/reference/design-imports/create-design-import-job/)
+
+### 8.6 React handoff UI
 
 ```tsx
-// apps/web/src/features/editor/SlideEditor.tsx
-type SlideEditorProps = {
-  slide: Slide;
-  onSave: (patch: Pick<Slide, "title" | "blocks" | "speaker_notes" | "layout_id">) => Promise<void>;
-};
+// apps/web/src/features/canva/CanvaHandoffButton.tsx
+export function CanvaHandoffButton({ deckId, connected }: { deckId: string; connected: boolean }) {
+  const [busy, setBusy] = useState(false);
 
-export function SlideEditor({ slide, onSave }: SlideEditorProps) {
-  const [title, setTitle] = useState(slide.title);
-  const [notes, setNotes] = useState(slide.speaker_notes);
+  async function handoff() {
+    setBusy(true);
+    try {
+      const response = await api.post(`/decks/${deckId}/canva-handoff`);
+      await waitForJob(response.data.job_id);
+      // Job result contains a temporary Canva edit URL.
+      window.open((await api.get(`/jobs/${response.data.job_id}`)).data.result.edit_url, "_blank", "noopener,noreferrer");
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  return (
-    <section aria-label={`Edit slide ${slide.order + 1}`}>
-      <input value={title} onChange={(event) => setTitle(event.target.value)} />
-      <textarea value={notes} onChange={(event) => setNotes(event.target.value)} />
-      <button onClick={() => onSave({ title, blocks: slide.blocks, speaker_notes: notes, layout_id: slide.layout_id })}>
-        Save correction
-      </button>
-    </section>
-  );
+  if (!connected) return <a href="/api/integrations/canva/authorize">Connect Canva</a>;
+  return <button disabled={busy} onClick={handoff}>{busy ? "Sending to Canva…" : "Open in Canva"}</button>;
 }
 ```
 
-The patch endpoint must re-run schema/layout/asset validation and return the updated slide plus overflow warnings. Support undo/redo with versioned deck revisions or an append-only local edit history—choose one during implementation, but never rely solely on browser history.
-
-**Done when:** title/text/notes/layout corrections update the server deck and rebuild all exports; free-form object editing remains unavailable by design.
+Place the one-way-sync notice immediately beside this action, not in a hidden settings page.
 
 ---
 
-## 11. Phase 7 — Local mode and speaker scripts
+## 9. Optional Canva AI mode — after MVP only
 
-### Ollama detection
+This is a separate experiment, not a model-provider fallback.
 
-```python
-# apps/api/app/ai/ollama.py
-import httpx
+- User explicitly selects **Generate design in Canva (Experimental)**.
+- Pekora sends a compact approved brief and outline, not unreviewed full source text by default.
+- Check the user’s `design_generation` capability before enabling the action.
+- Handle `credit_quota_exceeded`, `model_not_available`, safety rejection, and generation failure without silently using another service.
+- Save the returned Canva design link as a Canva-owned result; do not attempt to reconstruct it as Pekora slide JSON.
 
-async def get_ollama_status(base_url: str) -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{base_url.rstrip('/')}/api/tags")
-            response.raise_for_status()
-    except httpx.HTTPError:
-        return {"available": False, "models": []}
-    models = [item["name"] for item in response.json().get("models", [])]
-    return {"available": True, "models": models}
+Canva states this API is preview-only and public apps using preview APIs cannot pass review; its use should therefore remain personal/experimental until Canva’s status changes. [Canva Generations API](https://www.canva.dev/docs/apps/rest-apis/reference/generations/)
+
+---
+
+## 10. Delivery phases and completion checks
+
+| Phase | Deliverable | Done when |
+| --- | --- | --- |
+| 0 | Repository, contracts, fonts, local tools | Hand-authored JSON validates and renders locally. |
+| 1 | Fixed layouts, PPTX/PDF/PNG | Layout gallery exports correct page/slide/image counts. |
+| 2 | Projects, jobs, quick-create UI, non-AI deck | Topic to text-only export works without a model. |
+| 3 | First cloud model + validator/router | Invalid model output cannot reach the builder; fallback is bounded. |
+| 4 | Themes, PDF/URL/OCR ingest, provenance | Grounded deck preserves source references and rejects unsafe URLs. |
+| 5 | Image approval gallery | No unapproved candidate can appear in exported deck JSON or PPTX. |
+| 6 | Corrective editor + speaker script | Corrections revise exports; script becomes stale after relevant edit. |
+| 7 | Ollama + additional model providers | Local option appears only when a compatible installed model is detected. |
+| 8 | Canva Connect + PPTX import handoff | User authorizes Canva, imports current deck, opens returned edit URL, and sees one-way-sync warning. |
+| 9 | Experimental Canva AI (optional) | Only opt-in users with capability/credits can submit; failures are clear and isolated. |
+
+---
+
+## 11. Test plan
+
+### Native Pekora tests
+
+- Schema/layout/overflow validation.
+- PPTX → PDF → PNG gallery tests across every theme/layout.
+- Model provider mock failures: timeout, quota, 429, malformed JSON, refusal.
+- URL SSRF/redirect checks; PDF/image file validation; prompt-injection fixtures.
+- Image candidate approval enforcement, duplicate removal, attribution preservation.
+- Ollama absent/present/oversized-model states.
+
+### Canva-specific tests
+
+- PKCE state is single-use, expiring, and verified before token exchange.
+- OAuth client secret/token data never appear in logs, API responses, or browser storage.
+- Unconnected user cannot request a handoff.
+- A deck handoff always exports the exact current deck revision and stores that revision ID.
+- Import `in_progress`, `success`, `failed`, throttled, invalid-file, and expired-token cases update Pekora jobs correctly.
+- Returned edit links open only after job success; UI labels them temporary and shows the one-way-sync notice.
+- Canva design-generation UI remains disabled without user capability and is excluded from normal Pekora provider fallback tests.
+
+---
+
+## 12. Configuration and deployment notes
+
+```text
+APP_DATA_DIR=./data
+DATABASE_URL=sqlite:///./data/pekora.db
+LIBREOFFICE_BIN=soffice
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+
+CANVA_CLIENT_ID=...
+CANVA_CLIENT_SECRET=...
+CANVA_REDIRECT_URI=http://localhost:8000/api/integrations/canva/callback
+TOKEN_ENCRYPTION_KEY=...
+
+GEMINI_API_KEY=...
+GROQ_API_KEY=...
+OPENROUTER_API_KEY=...
 ```
 
-Never auto-download models. Manual RAM/VRAM/unified-memory selections offer guidance, but they do not claim to detect hardware. Local generation uses outline-first, slide-by-slide structured output with an explicit context window. Offline with no Ollama still exposes the non-AI builder.
+For personal local use, run the API and UI on the same computer as LibreOffice and Ollama. A remote deployment can support cloud models and Canva but cannot assume access to local Ollama without an explicit, secure local-agent/network design.
 
-### Script rules
-
-Generate scripts from the final deck revision. Mark a script stale when a slide changes. In Grounded mode, only include sourced slide facts plus non-factual transitions/questions/analogies. In Creative mode, flag unsourced claims for review.
-
-**Done when:** the UI accurately reports local capability, never tries unavailable Ollama, and a script is revision-linked to the deck.
+Before public deployment, add authentication, CSRF protection, secure token key management, upload limits, retention/deletion rules, a reverse proxy, backups, and a formal privacy review.
 
 ---
 
-## 12. Verification plan
+## 13. Version-one boundary
 
-| Suite | Essential assertions |
-| --- | --- |
-| Contracts | Invalid orders, overflow content, illegal image/layout pair, and missing asset approval fail validation. |
-| Builder/render | Every layout fixture creates PPTX, matching PDF pages, and expected PNG count. |
-| Providers | 429, quota, timeout, refusal, and malformed JSON result in bounded fallback/circuit-break behavior. |
-| Ingest/security | Private IP, redirect-to-private-IP, giant response, spoofed MIME, malicious PDF, and injection text are safely handled. |
-| Images | Unapproved, duplicate, low-resolution, failed-download, and license-unknown candidates behave as specified. |
-| Local mode | Ollama unavailable/available/oversized selection states are clear; no-Ollama offline fallback works. |
-| E2E | Topic → outline → optional image approval → deck → correction → PPTX/PDF/PNG/script. |
+Pekora v1 is complete when a user can create, edit lightly, and export a grounded or creative presentation; approve images before use; generate a script; use cloud or local generation when available; and hand off the final PPTX to Canva for optional further editing.
 
-Use a rendered “layout gallery” fixture as a release gate. It should include longest permitted titles/bullets, representative images, every bundled font, and every theme.
-
----
-
-## 13. Build sequence
-
-1. **Week 1:** contracts, SQLite models, fixture deck, one deterministic layout.
-2. **Week 2:** remaining fixed layouts, PPTX/PDF/PNG pipeline, layout-gallery test.
-3. **Week 3:** project/job API and React quick-create flow, non-AI deck.
-4. **Weeks 4–5:** first cloud provider, strict validation, provider failures, progress UI.
-5. **Weeks 6–7:** themes, PDF/URL/OCR ingestion, source provenance and safety tests.
-6. **Weeks 8–9:** image search/approval/cache/attribution.
-7. **Week 10:** minimal editor and script generation.
-8. **Weeks 11–12:** additional providers, OpenRouter, Ollama, hardening, PWA and release documentation.
-
-The timeline is an estimate for part-time solo work. Each phase ends with a small working release; do not begin a later phase until its acceptance criteria pass.
-
----
-
-## 14. Explicit non-goals for version one
-
-- Free-form PowerPoint-quality editing in the browser.
-- Generated images.
-- Multi-user collaboration, accounts, billing, or public SaaS hosting.
-- Automatic Ollama installation/model downloads.
-- Image inclusion without user approval.
-- Guaranteeing perfect visual parity between LibreOffice and Microsoft PowerPoint.
-
-These boundaries preserve the core promise: a reliable, editable-enough presentation generator whose output and behavior remain predictable across multiple AI providers.
+Pekora does **not** promise bidirectional Canva sync, arbitrary free-form editing, generated images, multi-user collaboration, automatic model installation, or exact visual equality between LibreOffice and PowerPoint.
