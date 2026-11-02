@@ -1,2 +1,1 @@
-# Deckora-PPT-
-DEckora- PPT generation ai tool
+A simple yet powerful tool that helps turn ideas, documents, links, and images into well-designed presentations. It brings together different AI models, including local models through Ollama, with options to customize themes, choose images, edit slides, and create presentation scripts. Once everything is ready, you can export your work as a PowerPoint, PDF, or PNG. It also includes offline support, so you can keep working even without an internet connection.
